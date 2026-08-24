@@ -26,10 +26,16 @@
 
 #include "BrowserWindow.h"
 #include "Common.h"
+#include "XanhProcessRecoveryPolicy.h"
 #include <WebKit/WKRetainPtr.h>
 #include <WebKit/WebKit2_C.h>
+#include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <wtf/Ref.h>
+
+class XanhCredentialBridge;
+class XanhNativeCredentialPicker;
 
 class WebKitBrowserWindow : public BrowserWindow {
 public:
@@ -37,6 +43,7 @@ public:
 
 private:
     WebKitBrowserWindow(BrowserWindowClient&, WKPageConfigurationRef, HWND mainWnd);
+    ~WebKitBrowserWindow() override;
 
     HRESULT init() override;
     HWND hwnd() override;
@@ -65,6 +72,13 @@ private:
 
     void clearCookies() override;
     void clearWebsiteData() override;
+    void applicationActivationChanged(bool, HWND) override;
+    void beginFirefoxSync() override;
+    void syncFirefoxSync() override;
+    void disconnectFirefoxSync(bool) override;
+    bool canHandleFirefoxSyncCallback() override;
+    bool handleFirefoxSyncCallback(std::wstring&&) override;
+    bool handleFirefoxSyncPresentation(WPARAM, LPARAM) override;
 
     void updateProxySettings();
     void adjustScaleFactors() override;
@@ -75,12 +89,18 @@ private:
     static void didChangeIsLoading(const void*);
     static void didChangeEstimatedProgress(const void*);
     static void didChangeActiveURL(const void*);
+    static void decidePolicyForNavigationAction(WKPageRef, WKNavigationActionRef, WKFramePolicyListenerRef, WKTypeRef, const void*);
     static void decidePolicyForNavigationResponse(WKPageRef, WKNavigationResponseRef, WKFramePolicyListenerRef, WKTypeRef, const void*);
+    static void didStartProvisionalNavigation(WKPageRef, WKNavigationRef, WKTypeRef, const void*);
+    static void didCommitNavigation(WKPageRef, WKNavigationRef, WKTypeRef, const void*);
+    static void didFinishNavigation(WKPageRef, WKNavigationRef, WKTypeRef, const void*);
+    static void didSameDocumentNavigation(WKPageRef, WKNavigationRef, WKSameDocumentNavigationType, WKTypeRef, const void*);
     static void didFailProvisionalNavigation(WKPageRef, WKNavigationRef, WKErrorRef, WKTypeRef, const void*);
     static void didReceiveAuthenticationChallenge(WKPageRef, WKAuthenticationChallengeRef, const void*);
     static void navigationActionDidBecomeDownload(WKPageRef, WKNavigationActionRef, WKDownloadRef, const void*);
     static void navigationResponseDidBecomeDownload(WKPageRef, WKNavigationResponseRef, WKDownloadRef, const void*);
     static void contextMenuDidCreateDownload(WKPageRef, WKDownloadRef, const void*);
+    static void webProcessDidTerminate(WKPageRef, WKProcessTerminationReason, const void*);
     static void setDownloadClient(WKDownloadRef, const void*);
     static WKStringRef downloadDecideDestinationWithResponse(WKDownloadRef, WKURLResponseRef, WKStringRef, const void*);
     static void downloadDidFinish(WKDownloadRef, const void*);
@@ -95,10 +115,13 @@ private:
 
     BrowserWindowClient& m_client;
     WKRetainPtr<WKViewRef> m_view;
+    std::shared_ptr<XanhNativeCredentialPicker> m_nativeCredentialPicker;
+    std::unique_ptr<XanhCredentialBridge> m_credentialBridge;
+    std::uint64_t m_syncPresentationToken { 0 };
     HWND m_hMainWnd { nullptr };
     ProxySettings m_proxy { };
     std::unordered_map<std::wstring, std::wstring> m_acceptedServerTrustCerts;
     std::vector<WKRetainPtr<WKStringRef>> m_experimentalFeatureKeys;
     std::vector<WKRetainPtr<WKStringRef>> m_internalDebugFeatureKeys;
-    bool m_isControlledByAutomation { false };
+    XanhProcessRecovery::Policy m_processRecoveryPolicy;
 };

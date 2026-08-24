@@ -27,6 +27,7 @@
 #include "WKUserScriptRef.h"
 
 #include "APIArray.h"
+#include "APIContentWorld.h"
 #include "APIUserScript.h"
 #include "WKAPICast.h"
 
@@ -40,6 +41,19 @@ WKTypeID WKUserScriptGetTypeID()
 WKUserScriptRef WKUserScriptCreateWithSource(WKStringRef sourceRef, _WKUserScriptInjectionTime injectionTime, bool forMainFrameOnly)
 {
     return toAPILeakingRef(API::UserScript::create(WebCore::UserScript { toWTFString(sourceRef), { }, { }, { }, toUserScriptInjectionTime(injectionTime), forMainFrameOnly ? WebCore::UserContentInjectedFrames::InjectInTopFrameOnly : WebCore::UserContentInjectedFrames::InjectInAllFrames }, API::ContentWorld::pageContentWorldSingleton()));
+}
+
+WKUserScriptRef WKXanhUserScriptCreateWithSourceInWorld(WKStringRef sourceRef, _WKUserScriptInjectionTime injectionTime, bool forMainFrameOnly, WKStringRef worldNameRef)
+{
+    if (!worldNameRef)
+        return nullptr;
+
+    String worldName = toWTFString(worldNameRef);
+    if (worldName.isEmpty() || worldName.length() > 128)
+        return nullptr;
+
+    auto world = API::ContentWorld::sharedWorldWithName(worldName);
+    return toAPILeakingRef(API::UserScript::create(WebCore::UserScript { toWTFString(sourceRef), { }, { }, { }, toUserScriptInjectionTime(injectionTime), forMainFrameOnly ? WebCore::UserContentInjectedFrames::InjectInTopFrameOnly : WebCore::UserContentInjectedFrames::InjectInAllFrames }, world.get()));
 }
 
 WKStringRef WKUserScriptCopySource(WKUserScriptRef userScriptRef)

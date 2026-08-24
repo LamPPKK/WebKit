@@ -29,13 +29,21 @@
 #include "Common.h"
 #include "MiniBrowserLibResource.h"
 #include "WebKitBrowserWindow.h"
+#include "XanhNavigationPolicy.h"
+#include "XanhPortableBackup.h"
+#include <algorithm>
+#include <chrono>
+#include <optional>
+#include <shobjidl.h>
 #include <sstream>
+#include <stdexcept>
+#include <wrl/client.h>
 
 namespace WebCore {
 float deviceScaleFactorForWindow(HWND);
 }
 
-static const wchar_t* kMiniBrowserRegistryKey = L"Software\\WebKit\\MiniBrowser";
+static const wchar_t* kMiniBrowserRegistryKey = L"Software\\Xanh Browser\\WebKit";
 
 static constexpr int kToolbarImageSize = 32;
 static constexpr int kToolbarURLBarIndex = 4;
@@ -48,6 +56,195 @@ static INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
 std::wstring MainWindow::s_windowClass;
 size_t MainWindow::s_numInstances;
+std::vector<MainWindow*> MainWindow::s_instances;
+
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE handle = INVALID_HANDLE_VALUE)
+        : m_handle(handle)
+    {
+    }
+
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+    ~UniqueHandle()
+    {
+        if (m_handle != INVALID_HANDLE_VALUE)
+            CloseHandle(m_handle);
+    }
+
+    HANDLE get() const { return m_handle; }
+
+private:
+    HANDLE m_handle;
+};
+
+class SecurePassword {
+public:
+    SecurePassword() = default;
+    SecurePassword(const SecurePassword&) = delete;
+    SecurePassword& operator=(const SecurePassword&) = delete;
+    ~SecurePassword() { clear(); }
+
+    void clear()
+    {
+        if (!value.empty())
+            SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t));
+        value.clear();
+    }
+
+    std::wstring value;
+};
+
+struct BackupPasswordDialogState {
+    SecurePassword* password { nullptr };
+    bool requiresConfirmation { false };
+};
+
+std::wstring readDialogText(HWND dialog, int control)
+{
+    int length = GetWindowTextLength(GetDlgItem(dialog, control));
+    if (length < 0 || length > 1024)
+        throw std::runtime_error("Invalid backup password length.");
+    std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
+    int copied = GetDlgItemText(dialog, control, buffer.data(), static_cast<int>(buffer.size()));
+    std::wstring result(buffer.data(), static_cast<size_t>(std::max(copied, 0)));
+    SecureZeroMemory(buffer.data(), buffer.size() * sizeof(wchar_t));
+    return result;
+}
+
+void secureErase(std::wstring& value)
+{
+    if (!value.empty())
+        SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t));
+    value.clear();
+}
+
+std::optional<std::wstring> pathFromDialog(IFileDialog& dialog)
+{
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog.GetResult(&item)))
+        throw std::runtime_error("Could not read the selected backup path.");
+    PWSTR rawPath = nullptr;
+    HRESULT pathResult = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
+    if (FAILED(pathResult) || !rawPath) {
+        if (rawPath)
+            CoTaskMemFree(rawPath);
+        throw std::runtime_error("The backup must be stored in a filesystem location.");
+    }
+    std::wstring path(rawPath);
+    CoTaskMemFree(rawPath);
+    if (path.empty())
+        throw std::runtime_error("The selected backup path is empty.");
+    return path;
+}
+
+std::optional<std::wstring> chooseBackupPath(HWND owner, bool exporting)
+{
+    constexpr COMDLG_FILTERSPEC filter[] = {
+        { L"Xanh Browser encrypted backup (*.xanhbackup)", L"*.xanhbackup" },
+    };
+
+    ComPtr<IFileDialog> dialog;
+    HRESULT result = exporting
+        ? CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))
+        : CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(result))
+        throw std::runtime_error("Could not open the backup file picker.");
+    DWORD options = 0;
+    if (FAILED(dialog->GetOptions(&options)))
+        throw std::runtime_error("Could not configure the backup file picker.");
+    options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+    options |= exporting ? FOS_OVERWRITEPROMPT | FOS_NOREADONLYRETURN : FOS_FILEMUSTEXIST;
+    if (FAILED(dialog->SetOptions(options)) || FAILED(dialog->SetFileTypes(_countof(filter), filter)))
+        throw std::runtime_error("Could not configure the backup file picker.");
+    if (exporting) {
+        if (FAILED(dialog->SetDefaultExtension(L"xanhbackup")) || FAILED(dialog->SetFileName(L"xanh-browser.xanhbackup"))
+            || FAILED(dialog->SetTitle(L"Export encrypted Xanh Browser backup")))
+            throw std::runtime_error("Could not configure the backup export picker.");
+    } else if (FAILED(dialog->SetTitle(L"Import encrypted Xanh Browser backup")))
+        throw std::runtime_error("Could not configure the backup import picker.");
+    result = dialog->Show(owner);
+    if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        return std::nullopt;
+    if (FAILED(result))
+        throw std::runtime_error("The backup file picker failed.");
+    auto path = pathFromDialog(*dialog.Get());
+    if (exporting) {
+        constexpr std::wstring_view extension = L".xanhbackup";
+        if (path->size() < extension.size() || _wcsicmp(path->c_str() + path->size() - extension.size(), extension.data()))
+            throw std::runtime_error("The confirmed export path must end in .xanhbackup.");
+    }
+    return path;
+}
+
+std::vector<uint8_t> readBackupFile(const std::wstring& path)
+{
+    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Could not open the selected backup.");
+    LARGE_INTEGER size { };
+    if (!GetFileSizeEx(file.get(), &size) || size.QuadPart < 0 || static_cast<uint64_t>(size.QuadPart) > XanhPortableBackup::maximumEncodedBytes)
+        throw std::runtime_error("The selected backup is too large.");
+    std::vector<uint8_t> bytes(static_cast<size_t>(size.QuadPart));
+    size_t position = 0;
+    while (position < bytes.size()) {
+        DWORD read = 0;
+        if (!ReadFile(file.get(), bytes.data() + position, static_cast<DWORD>(bytes.size() - position), &read, nullptr) || !read)
+            throw std::runtime_error("Could not read the complete backup.");
+        position += read;
+    }
+    return bytes;
+}
+
+std::wstring temporaryBackupPath(const std::wstring& destination)
+{
+    GUID identifier;
+    if (FAILED(CoCreateGuid(&identifier)))
+        throw std::runtime_error("Could not create a temporary backup name.");
+    wchar_t identifierText[40] { };
+    if (!StringFromGUID2(identifier, identifierText, _countof(identifierText)))
+        throw std::runtime_error("Could not create a temporary backup name.");
+    return destination + L".tmp-" + identifierText;
+}
+
+void writeBackupFileAtomically(const std::wstring& destination, const std::vector<uint8_t>& bytes)
+{
+    if (bytes.empty() || bytes.size() > XanhPortableBackup::maximumEncodedBytes)
+        throw std::runtime_error("Invalid backup output size.");
+    auto temporary = temporaryBackupPath(destination);
+    bool mustDeleteTemporary = true;
+    try {
+        {
+            UniqueHandle file(CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr));
+            if (file.get() == INVALID_HANDLE_VALUE)
+                throw std::runtime_error("Could not create the temporary backup.");
+            size_t position = 0;
+            while (position < bytes.size()) {
+                DWORD written = 0;
+                if (!WriteFile(file.get(), bytes.data() + position, static_cast<DWORD>(bytes.size() - position), &written, nullptr) || !written)
+                    throw std::runtime_error("Could not write the complete backup.");
+                position += written;
+            }
+            if (!FlushFileBuffers(file.get()))
+                throw std::runtime_error("Could not make the backup durable.");
+        }
+        if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error("Could not publish the encrypted backup.");
+        mustDeleteTemporary = false;
+    } catch (...) {
+        if (mustDeleteTemporary)
+            DeleteFileW(temporary.c_str());
+        throw;
+    }
+}
+
+} // namespace
 
 static std::wstring loadString(int id)
 {
@@ -91,6 +288,30 @@ bool MainWindow::isInstance(HWND hwnd)
     return s_windowClass == buff;
 }
 
+HWND MainWindow::routeFirefoxSyncCallback(std::wstring&& callback)
+{
+    auto target = std::find_if(s_instances.begin(), s_instances.end(),
+        [](auto* window) {
+            return window && window->browserWindow()
+                && window->browserWindow()->canHandleFirefoxSyncCallback();
+        });
+    if (target == s_instances.end())
+        return nullptr;
+    if (!(*target)->browserWindow()->handleFirefoxSyncCallback(
+            std::move(callback)))
+        return nullptr;
+    return (*target)->hwnd();
+}
+
+HWND MainWindow::findExistingInstance(HINSTANCE instance)
+{
+    wchar_t windowClass[100] { };
+    if (!LoadStringW(instance, IDC_MINIBROWSER, windowClass,
+            static_cast<int>(std::size(windowClass))))
+        return nullptr;
+    return FindWindowW(windowClass, nullptr);
+}
+
 MainWindow::MainWindow()
 {
     s_numInstances++;
@@ -98,6 +319,8 @@ MainWindow::MainWindow()
 
 MainWindow::~MainWindow()
 {
+    if (m_isRegisteredInstance)
+        s_instances.erase(std::remove(s_instances.begin(), s_instances.end(), this), s_instances.end());
     s_numInstances--;
 }
 
@@ -225,6 +448,8 @@ bool MainWindow::init(BrowserWindowFactory factory, HINSTANCE hInstance, bool us
     updateDeviceScaleFactor();
     resizeSubViews();
     SetFocus(m_hURLBarWnd);
+    s_instances.push_back(this);
+    m_isRegisteredInstance = true;
     return true;
 }
 
@@ -251,7 +476,53 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPA
     LRESULT result = 0;
     RefPtr<MainWindow> thisWindow = reinterpret_cast<MainWindow*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
     switch (message) {
+    case XanhActivateExistingWindowMessage:
+        if (thisWindow) {
+            ShowWindow(hWnd, SW_RESTORE);
+            SetForegroundWindow(hWnd);
+        }
+        return 0;
+    case XanhFirefoxSyncResultMessage:
+        if (thisWindow && thisWindow->browserWindow()
+            && thisWindow->browserWindow()->handleFirefoxSyncPresentation(
+                wParam, lParam))
+            return 0;
+        break;
+    case WM_COPYDATA: {
+        if (!thisWindow || !thisWindow->browserWindow())
+            return FALSE;
+        auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+        if (!data || (data->dwData != XanhOAuthCallbackCopyData
+                && data->dwData != XanhNavigationCopyData)
+            || !data->lpData || !data->cbData
+            || data->cbData % sizeof(wchar_t)
+            || data->cbData > (XanhMaximumInterprocessURLCharacters + 1)
+                * sizeof(wchar_t))
+            return FALSE;
+        auto characters = data->cbData / sizeof(wchar_t);
+        auto* value = static_cast<const wchar_t*>(data->lpData);
+        if (characters < 2 || value[characters - 1] != L'\0'
+            || std::find(value, value + characters - 1, L'\0')
+                != value + characters - 1)
+            return FALSE;
+        std::wstring incoming(value, characters - 1);
+        HWND activationWindow = hWnd;
+        if (data->dwData == XanhOAuthCallbackCopyData) {
+            activationWindow = routeFirefoxSyncCallback(std::move(incoming));
+            if (!activationWindow) {
+                secureErase(incoming);
+                return FALSE;
+            }
+        } else
+            thisWindow->loadURL(std::move(incoming));
+        secureErase(incoming);
+        ShowWindow(activationWindow, SW_RESTORE);
+        SetForegroundWindow(activationWindow);
+        return TRUE;
+    }
     case WM_ACTIVATE:
+        thisWindow->browserWindow()->applicationActivationChanged(
+            LOWORD(wParam) != WA_INACTIVE, reinterpret_cast<HWND>(lParam));
         switch (LOWORD(wParam)) {
         case WA_ACTIVE:
         case WA_CLICKACTIVE:
@@ -323,6 +594,32 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPA
             break;
         case IDM_PRINT:
             thisWindow->browserWindow()->print();
+            break;
+        case IDM_EXPORT_PORTABLE_BACKUP:
+            thisWindow->exportPortableBackup();
+            break;
+        case IDM_IMPORT_PORTABLE_BACKUP:
+            thisWindow->importPortableBackup();
+            break;
+        case IDM_FIREFOX_SYNC_SIGN_IN:
+            thisWindow->browserWindow()->beginFirefoxSync();
+            break;
+        case IDM_FIREFOX_SYNC_NOW:
+            thisWindow->browserWindow()->syncFirefoxSync();
+            break;
+        case IDM_FIREFOX_SYNC_DISCONNECT:
+            if (MessageBoxW(hWnd,
+                    L"Disconnect Firefox Sync and keep local browser data?",
+                    L"Xanh Browser", MB_YESNO | MB_ICONQUESTION)
+                == IDYES)
+                thisWindow->browserWindow()->disconnectFirefoxSync(false);
+            break;
+        case IDM_FIREFOX_SYNC_REMOVE_DEVICE:
+            if (MessageBoxW(hWnd,
+                    L"Remove the Firefox account, Sync databases and local password key from this device? This cannot be undone.",
+                    L"Xanh Browser", MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING)
+                == IDYES)
+                thisWindow->browserWindow()->disconnectFirefoxSync(true);
             break;
         case IDM_WEB_INSPECTOR:
             thisWindow->browserWindow()->launchInspector();
@@ -406,6 +703,63 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPA
 static bool menuItemIsChecked(const MENUITEMINFO& info)
 {
     return info.fState & MFS_CHECKED;
+}
+
+INT_PTR CALLBACK MainWindow::backupPasswordDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto* state = reinterpret_cast<BackupPasswordDialogState*>(GetWindowLongPtr(dialog, DWLP_USER));
+    switch (message) {
+    case WM_INITDIALOG:
+        state = reinterpret_cast<BackupPasswordDialogState*>(lParam);
+        SetWindowLongPtr(dialog, DWLP_USER, lParam);
+        SendDlgItemMessage(dialog, IDC_BACKUP_PASSWORD, EM_SETLIMITTEXT, 1024, 0);
+        SendDlgItemMessage(dialog, IDC_BACKUP_CONFIRMATION, EM_SETLIMITTEXT, 1024, 0);
+        if (state->requiresConfirmation) {
+            SetDlgItemText(dialog, IDC_BACKUP_PROMPT, L"Create a unique password with at least 8 characters.");
+            SetWindowText(dialog, L"Export encrypted backup");
+        } else {
+            SetDlgItemText(dialog, IDC_BACKUP_PROMPT, L"Enter the password used to create this backup.");
+            ShowWindow(GetDlgItem(dialog, IDC_BACKUP_CONFIRMATION_LABEL), SW_HIDE);
+            ShowWindow(GetDlgItem(dialog, IDC_BACKUP_CONFIRMATION), SW_HIDE);
+            SetWindowText(dialog, L"Import encrypted backup");
+        }
+        SetFocus(GetDlgItem(dialog, IDC_BACKUP_PASSWORD));
+        return FALSE;
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK) {
+            try {
+                auto password = readDialogText(dialog, IDC_BACKUP_PASSWORD);
+                if (password.size() < 8 || password.size() > 1024) {
+                    secureErase(password);
+                    MessageBoxW(dialog, L"The password must contain between 8 and 1,024 characters.", L"Xanh Browser", MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
+                if (state->requiresConfirmation) {
+                    auto confirmation = readDialogText(dialog, IDC_BACKUP_CONFIRMATION);
+                    bool matches = password == confirmation;
+                    secureErase(confirmation);
+                    if (!matches) {
+                        secureErase(password);
+                        MessageBoxW(dialog, L"The passwords do not match.", L"Xanh Browser", MB_OK | MB_ICONWARNING);
+                        return TRUE;
+                    }
+                }
+                state->password->clear();
+                state->password->value = password;
+                secureErase(password);
+                EndDialog(dialog, IDOK);
+            } catch (const std::exception&) {
+                MessageBoxW(dialog, L"The password could not be read securely.", L"Xanh Browser", MB_OK | MB_ICONERROR);
+            }
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
 }
 
 static void turnOffOtherUserAgents(HMENU menu)
@@ -583,15 +937,11 @@ INT_PTR CALLBACK MainWindow::customUserAgentDialogProc(HWND hDlg, UINT message, 
 
 void MainWindow::loadURL(std::wstring url)
 {
-    if (::PathFileExists(url.c_str()) || ::PathIsUNC(url.c_str())) {
-        wchar_t fileURL[INTERNET_MAX_URL_LENGTH];
-        DWORD fileURLLength = _countof(fileURL);
-
-        if (SUCCEEDED(::UrlCreateFromPath(url.c_str(), fileURL, &fileURLLength, 0)))
-            url = fileURL;
-    }
     if (url.find(L"://") == url.npos)
-        url = L"http://" + url;
+        url = L"https://" + url;
+
+    if (!XanhNavigationPolicy::isAllowedWebURL(url))
+        return;
 
     if (FAILED(m_browserWindow->loadURL(_bstr_t(url.c_str()))))
         return;
@@ -599,9 +949,108 @@ void MainWindow::loadURL(std::wstring url)
     SetFocus(m_browserWindow->hwnd());
 }
 
+void MainWindow::exportPortableBackup()
+{
+    try {
+        auto destination = chooseBackupPath(m_hMainWnd, true);
+        if (!destination)
+            return;
+
+        SecurePassword password;
+        BackupPasswordDialogState passwordState { &password, true };
+        auto dialogResult = DialogBoxParam(hInst, MAKEINTRESOURCE(IDD_PORTABLE_BACKUP_PASSWORD), m_hMainWnd, backupPasswordDialogProc, reinterpret_cast<LPARAM>(&passwordState));
+        if (dialogResult == IDCANCEL)
+            return;
+        if (dialogResult != IDOK)
+            throw std::runtime_error("Could not collect the backup password.");
+
+        XanhPortableBackup::Payload payload;
+        auto createdAt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (createdAt < 0)
+            throw std::runtime_error("The system clock cannot be used for a backup.");
+        payload.createdAtEpochMilliseconds = static_cast<uint64_t>(createdAt);
+        payload.sourceEdition = L"windows-wincairo";
+        payload.desktopSite = false;
+
+        auto appendWindow = [&](MainWindow* window) {
+            if (!window || payload.urls.size() >= XanhPortableBackup::maximumURLs)
+                return;
+            auto canonicalURL = XanhPortableBackup::canonicalizeURL(window->m_activeURL, XanhNavigationPolicy::isAllowedWebURL);
+            if (canonicalURL)
+                payload.urls.push_back(std::move(*canonicalURL));
+        };
+        appendWindow(this);
+        for (auto* window : s_instances) {
+            if (window != this)
+                appendWindow(window);
+        }
+        if (payload.urls.empty())
+            throw std::runtime_error("There are no regular HTTP(S) pages to export.");
+        payload.selectedIndex = 0;
+
+        auto encoded = XanhPortableBackup::encode(payload, password.value, XanhNavigationPolicy::isAllowedWebURL);
+        password.clear();
+        writeBackupFileAtomically(*destination, encoded);
+        MessageBoxW(m_hMainWnd, L"The encrypted backup was exported successfully.", L"Xanh Browser", MB_OK | MB_ICONINFORMATION);
+    } catch (const std::exception&) {
+        MessageBoxW(m_hMainWnd, L"The encrypted backup could not be exported. The destination was not replaced.", L"Xanh Browser", MB_OK | MB_ICONERROR);
+    }
+}
+
+void MainWindow::importPortableBackup()
+{
+    try {
+        auto source = chooseBackupPath(m_hMainWnd, false);
+        if (!source)
+            return;
+        auto encoded = readBackupFile(*source);
+
+        SecurePassword password;
+        BackupPasswordDialogState passwordState { &password, false };
+        auto dialogResult = DialogBoxParam(hInst, MAKEINTRESOURCE(IDD_PORTABLE_BACKUP_PASSWORD), m_hMainWnd, backupPasswordDialogProc, reinterpret_cast<LPARAM>(&passwordState));
+        if (dialogResult == IDCANCEL)
+            return;
+        if (dialogResult != IDOK)
+            throw std::runtime_error("Could not collect the backup password.");
+        auto payload = XanhPortableBackup::decode(encoded, password.value, XanhNavigationPolicy::isAllowedWebURL);
+        password.clear();
+
+        std::vector<MainWindow*> importedWindows;
+        importedWindows.reserve(payload.urls.size());
+        try {
+            for (const auto& url : payload.urls) {
+                auto canonicalURL = XanhPortableBackup::canonicalizeURL(url, XanhNavigationPolicy::isAllowedWebURL);
+                if (!canonicalURL)
+                    throw std::runtime_error("Backup URL validation changed before navigation.");
+                auto window = MainWindow::create();
+                if (!window->init(WebKitBrowserWindow::create, hInst)) {
+                    auto& failedWindow = window.leakRef();
+                    if (failedWindow.hwnd())
+                        DestroyWindow(failedWindow.hwnd());
+                    else
+                        failedWindow.deref();
+                    throw std::runtime_error("Could not create an imported browser window.");
+                }
+                window->loadURL(std::move(*canonicalURL));
+                importedWindows.push_back(&window.leakRef());
+            }
+        } catch (...) {
+            for (auto* window : importedWindows)
+                DestroyWindow(window->hwnd());
+            throw;
+        }
+        for (auto* window : importedWindows)
+            ShowWindow(window->hwnd(), SW_SHOW);
+        SetForegroundWindow(importedWindows[payload.selectedIndex]->hwnd());
+        MessageBoxW(importedWindows[payload.selectedIndex]->hwnd(), L"The encrypted backup was imported into new regular windows.", L"Xanh Browser", MB_OK | MB_ICONINFORMATION);
+    } catch (const std::exception&) {
+        MessageBoxW(m_hMainWnd, L"The backup could not be imported. Check the password, file integrity and URL contents.", L"Xanh Browser", MB_OK | MB_ICONERROR);
+    }
+}
+
 void MainWindow::goHome()
 {
-    std::wstring defaultURL = L"https://www.webkit.org/";
+    std::wstring defaultURL = L"https://duckduckgo.com/";
     wchar_t url[INTERNET_MAX_URL_LENGTH];
     DWORD urlLength = sizeof(url);
     if (!RegGetValue(HKEY_CURRENT_USER, kMiniBrowserRegistryKey, L"DefaultURL", RRF_RT_REG_SZ, nullptr, &url, &urlLength))
@@ -646,5 +1095,6 @@ void MainWindow::progressFinished()
 
 void MainWindow::activeURLChanged(std::wstring url)
 {
+    m_activeURL = url;
     SetWindowText(m_hURLBarWnd, url.c_str());
 }

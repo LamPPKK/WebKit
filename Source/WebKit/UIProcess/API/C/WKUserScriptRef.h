@@ -36,6 +36,7 @@ extern "C" {
 WK_EXPORT WKTypeID WKUserScriptGetTypeID(void);
 
 WK_EXPORT WKUserScriptRef WKUserScriptCreateWithSource(WKStringRef source, _WKUserScriptInjectionTime injectionTime, bool forMainFrameOnly);
+WK_EXPORT WKUserScriptRef WKXanhUserScriptCreateWithSourceInWorld(WKStringRef source, _WKUserScriptInjectionTime injectionTime, bool forMainFrameOnly, WKStringRef worldName);
 
 WK_EXPORT WKStringRef WKUserScriptCopySource(WKUserScriptRef userScript);
 WK_EXPORT _WKUserScriptInjectionTime WKUserScriptGetInjectionTime(WKUserScriptRef userScript);

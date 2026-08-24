@@ -29,6 +29,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 #include <wtf/RefPtr.h>
 
 class MainWindow final : public RefCounted<MainWindow>, public BrowserWindowClient {
@@ -48,20 +49,26 @@ public:
     void goHome();
 
     static bool isInstance(HWND);
+    static HWND findExistingInstance(HINSTANCE);
     
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+    static INT_PTR CALLBACK backupPasswordDialogProc(HWND, UINT, WPARAM, LPARAM);
     static INT_PTR CALLBACK customUserAgentDialogProc(HWND, UINT, WPARAM, LPARAM);
     static INT_PTR CALLBACK cachesDialogProc(HWND, UINT, WPARAM, LPARAM);
     static void registerClass(HINSTANCE hInstance);
     static std::wstring s_windowClass;
     static size_t s_numInstances;
+    static std::vector<MainWindow*> s_instances;
 
     MainWindow();
     void setDefaultURLToCurrentURL();
     bool toggleMenuItem(UINT menuID);
     void onURLBarEnter();
     void updateDeviceScaleFactor();
+    void exportPortableBackup();
+    void importPortableBackup();
+    static HWND routeFirefoxSyncCallback(std::wstring&&);
 
     void resetFeatureMenu(BrowserWindow::FeatureType, bool resetsSettingsToDefaults = false);
     void createToolbar(HINSTANCE);
@@ -80,5 +87,7 @@ private:
     HWND m_hCacheWnd { nullptr };
     HGDIOBJ m_hURLBarFont { nullptr };
     RefPtr<BrowserWindow> m_browserWindow;
+    std::wstring m_activeURL;
+    bool m_isRegisteredInstance { false };
     int m_toolbarItemsWidth { };
 };

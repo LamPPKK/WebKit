@@ -28,6 +28,10 @@
 #include "Common.h"
 #include "Common2.h"
 #include "MiniBrowserLibResource.h"
+#include "XanhCredentialBridge.h"
+#include "XanhNativeCredentialPicker.h"
+#include "XanhNavigationPolicy.h"
+#include "XanhProcessRecoveryPolicy.h"
 #include <WebCore/GDIUtilities.h>
 #include <WebKit/WKAuthenticationChallenge.h>
 #include <WebKit/WKAuthenticationDecisionListener.h>
@@ -39,6 +43,7 @@
 #include <WebKit/WKFrameInfoRef.h>
 #include <WebKit/WKHTTPCookieStoreRef.h>
 #include <WebKit/WKInspector.h>
+#include <WebKit/WKNavigationActionRef.h>
 #include <WebKit/WKNavigationResponseRef.h>
 #include <WebKit/WKPagePrivate.h>
 #include <WebKit/WKPreferencesRefPrivate.h>
@@ -46,12 +51,24 @@
 #include <WebKit/WKProtectionSpaceCurl.h>
 #include <WebKit/WKSecurityOriginRef.h>
 #include <WebKit/WKURLResponse.h>
+#include <WebKit/WKURLRequest.h>
 #include <WebKit/WKWebsiteDataStoreConfigurationRef.h>
 #include <WebKit/WKWebsiteDataStoreRef.h>
 #include <WebKit/WKWebsiteDataStoreRefCurl.h>
-#include <filesystem>
+#include <shellapi.h>
+#include <atomic>
 #include <sstream>
+#include <thread>
 #include <vector>
+
+static std::uint64_t nextSyncPresentationToken()
+{
+    static std::atomic<std::uint64_t> next { 1 };
+    auto value = next.fetch_add(1, std::memory_order_relaxed);
+    if (!value)
+        value = next.fetch_add(1, std::memory_order_relaxed);
+    return value;
+}
 
 std::wstring createString(WKURLRef wkURL)
 {
@@ -118,22 +135,6 @@ WKRetainPtr<WKURLRef> createWKURL(const std::wstring& str)
     return adoptWK(WKURLCreateWithUTF8CString(utf8.data()));
 }
 
-WKRetainPtr<WKStringRef> injectedBundlePath()
-{
-    auto module = GetModuleHandle(nullptr);
-    std::wstring path;
-    for (;;) {
-        path.resize(path.size() + MAX_PATH);
-        auto copied = GetModuleFileName(module, path.data(), path.size());
-        if (copied < path.size()) {
-            path.resize(copied);
-            break;
-        }
-    }
-    path = std::filesystem::path(path).replace_filename("MiniBrowserInjectedBundle.dll");
-    return createWKString(path);
-}
-
 Ref<BrowserWindow> WebKitBrowserWindow::create(BrowserWindowClient& client, HWND mainWnd, bool)
 {
     auto websiteDataStoreConf = adoptWK(WKWebsiteDataStoreConfigurationCreate());
@@ -141,13 +142,12 @@ Ref<BrowserWindow> WebKitBrowserWindow::create(BrowserWindowClient& client, HWND
     auto websiteDataStore = adoptWK(WKWebsiteDataStoreCreateWithConfiguration(websiteDataStoreConf.get()));
 
     auto contextConf = adoptWK(WKContextConfigurationCreate());
-    WKContextConfigurationSetInjectedBundlePath(contextConf.get(), injectedBundlePath().get());
 
     auto context = adoptWK(WKContextCreateWithConfiguration(contextConf.get()));
 
     auto preferences = adoptWK(WKPreferencesCreate());
     WKPreferencesSetMediaCapabilitiesEnabled(preferences.get(), false);
-    WKPreferencesSetDeveloperExtrasEnabled(preferences.get(), true);
+    WKPreferencesSetDeveloperExtrasEnabled(preferences.get(), false);
 
     auto pageConf = adoptWK(WKPageConfigurationCreate());
     WKPageConfigurationSetWebsiteDataStore(pageConf.get(), websiteDataStore.get());
@@ -159,24 +159,45 @@ Ref<BrowserWindow> WebKitBrowserWindow::create(BrowserWindowClient& client, HWND
 
 WebKitBrowserWindow::WebKitBrowserWindow(BrowserWindowClient& client, WKPageConfigurationRef pageConf, HWND mainWnd)
     : m_client(client)
+    , m_syncPresentationToken(nextSyncPresentationToken())
     , m_hMainWnd(mainWnd)
 {
+    m_nativeCredentialPicker = XanhNativeCredentialPicker::shared();
+    m_credentialBridge = std::make_unique<XanhCredentialBridge>(
+        pageConf,
+        false,
+        [picker = m_nativeCredentialPicker, mainWnd](
+            XanhCredentialBridgePolicy::Request request,
+            XanhCredentialBridge::PickerCompletion completion) {
+            picker->pick(mainWnd, std::move(request), std::move(completion));
+        },
+        [this] {
+            return GetForegroundWindow() == m_hMainWnd && IsWindowVisible(m_hMainWnd) && !IsIconic(m_hMainWnd);
+        },
+        [picker = m_nativeCredentialPicker, mainWnd] {
+            picker->cancel(mainWnd);
+        });
     RECT rect = { };
     m_view = adoptWK(WKViewCreate(rect, pageConf, mainWnd));
     WKViewSetIsInWindow(m_view.get(), true);
 
     auto page = WKViewGetPage(m_view.get());
-    m_isControlledByAutomation = WKPageGetIsControlledByAutomation(page);
-
+    m_credentialBridge->attachPage(page);
     WKPageNavigationClientV3 navigationClient = { };
     navigationClient.base.version = 3;
     navigationClient.base.clientInfo = this;
+    navigationClient.decidePolicyForNavigationAction = decidePolicyForNavigationAction;
     navigationClient.decidePolicyForNavigationResponse = decidePolicyForNavigationResponse;
+    navigationClient.didStartProvisionalNavigation = didStartProvisionalNavigation;
+    navigationClient.didCommitNavigation = didCommitNavigation;
+    navigationClient.didFinishNavigation = didFinishNavigation;
+    navigationClient.didSameDocumentNavigation = didSameDocumentNavigation;
     navigationClient.didFailProvisionalNavigation = didFailProvisionalNavigation;
     navigationClient.didReceiveAuthenticationChallenge = didReceiveAuthenticationChallenge;
     navigationClient.navigationActionDidBecomeDownload = navigationActionDidBecomeDownload;
     navigationClient.navigationResponseDidBecomeDownload = navigationResponseDidBecomeDownload;
     navigationClient.contextMenuDidCreateDownload = contextMenuDidCreateDownload;
+    navigationClient.webProcessDidTerminate = webProcessDidTerminate;
     WKPageSetPageNavigationClient(page, &navigationClient.base);
 
     WKPageUIClientV13 uiClient = { };
@@ -203,6 +224,231 @@ WebKitBrowserWindow::WebKitBrowserWindow(BrowserWindowClient& client, WKPageConf
     updateProxySettings();
 
     adjustScaleFactors();
+}
+
+WebKitBrowserWindow::~WebKitBrowserWindow()
+{
+    m_syncPresentationToken = 0;
+    m_nativeCredentialPicker->windowClosed(m_hMainWnd);
+}
+
+void WebKitBrowserWindow::applicationActivationChanged(bool isActive, HWND otherWindow)
+{
+    m_nativeCredentialPicker->applicationActivationChanged(
+        m_hMainWnd, isActive, otherWindow);
+}
+
+static void postSyncPresentation(HWND ownerWindow, std::uint64_t token,
+    XanhFirefoxSyncPresentation presentation)
+{
+    if (ownerWindow && token)
+        PostMessageW(ownerWindow, XanhFirefoxSyncResultMessage,
+            static_cast<WPARAM>(token), static_cast<LPARAM>(presentation));
+}
+
+static XanhFirefoxSyncPresentation syncPresentation(
+    XanhNativeCredentialPicker::SyncStatus status)
+{
+    switch (status) {
+    case XanhNativeCredentialPicker::SyncStatus::success:
+        return XanhFirefoxSyncPresentation::syncCompleted;
+    case XanhNativeCredentialPicker::SyncStatus::partial:
+        return XanhFirefoxSyncPresentation::syncPartial;
+    case XanhNativeCredentialPicker::SyncStatus::networkError:
+        return XanhFirefoxSyncPresentation::syncNetworkError;
+    case XanhNativeCredentialPicker::SyncStatus::authError:
+        return XanhFirefoxSyncPresentation::syncAuthError;
+    case XanhNativeCredentialPicker::SyncStatus::backedOff:
+        return XanhFirefoxSyncPresentation::syncBackedOff;
+    }
+    return XanhFirefoxSyncPresentation::syncFailed;
+}
+
+static bool registerFirefoxSyncProtocol()
+{
+    std::vector<wchar_t> executablePath(32768);
+    auto pathLength = GetModuleFileNameW(nullptr, executablePath.data(),
+        static_cast<DWORD>(executablePath.size()));
+    if (!pathLength || pathLength >= executablePath.size())
+        return false;
+
+    constexpr auto protocolKey =
+        L"Software\\Classes\\xanh-browser-wincairo";
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, protocolKey, 0, nullptr, 0,
+            KEY_SET_VALUE, nullptr, &key, nullptr)
+        != ERROR_SUCCESS)
+        return false;
+    constexpr wchar_t description[] = L"URL:Xanh Browser Firefox Sync";
+    constexpr wchar_t empty[] = L"";
+    bool success = RegSetValueExW(key, nullptr, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(description),
+                       sizeof(description))
+            == ERROR_SUCCESS
+        && RegSetValueExW(key, L"URL Protocol", 0, REG_SZ,
+               reinterpret_cast<const BYTE*>(empty), sizeof(empty))
+            == ERROR_SUCCESS;
+    RegCloseKey(key);
+    if (!success)
+        return false;
+
+    HKEY commandKey = nullptr;
+    std::wstring command = L"\"";
+    command.append(executablePath.data(), pathLength);
+    command += L"\" \"%1\"";
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Classes\\xanh-browser-wincairo\\shell\\open\\command",
+            0, nullptr, 0, KEY_SET_VALUE, nullptr, &commandKey, nullptr)
+        != ERROR_SUCCESS)
+        return false;
+    success = RegSetValueExW(commandKey, nullptr, 0, REG_SZ,
+                  reinterpret_cast<const BYTE*>(command.c_str()),
+                  static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)))
+        == ERROR_SUCCESS;
+    RegCloseKey(commandKey);
+    SecureZeroMemory(command.data(), command.size() * sizeof(wchar_t));
+    return success;
+}
+
+void WebKitBrowserWindow::beginFirefoxSync()
+{
+    if (!m_nativeCredentialPicker->canBeginOAuth(m_hMainWnd)) {
+        MessageBoxW(m_hMainWnd,
+            L"Firefox Sync is unavailable in this build. Install a configured signed native Sync package before signing in.",
+            L"Xanh Browser", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (!registerFirefoxSyncProtocol()) {
+        MessageBoxW(m_hMainWnd,
+            L"The per-user Firefox Sync callback handler could not be registered.",
+            L"Xanh Browser", MB_OK | MB_ICONERROR);
+        return;
+    }
+    auto url = m_nativeCredentialPicker->beginOAuth(m_hMainWnd);
+    if (!url) {
+        MessageBoxW(m_hMainWnd,
+            L"Firefox Sync sign-in could not be started. Finish or retry the current Sync operation, then try again.",
+            L"Xanh Browser", MB_OK | MB_ICONERROR);
+        return;
+    }
+    auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(m_hMainWnd, L"open",
+        url->view().data(), nullptr, nullptr, SW_SHOWNORMAL));
+    if (result <= 32) {
+        auto message = m_nativeCredentialPicker->abandonOAuth(m_hMainWnd)
+            ? L"The system browser could not be opened. The sign-in flow was discarded; try again."
+            : L"The system browser could not be opened. Restart Xanh before retrying sign-in.";
+        MessageBoxW(m_hMainWnd, message, L"Xanh Browser",
+            MB_OK | MB_ICONERROR);
+    }
+}
+
+bool WebKitBrowserWindow::handleFirefoxSyncCallback(std::wstring&& callbackURL)
+{
+    auto callback = XanhSensitiveWide::take(std::move(callbackURL));
+    auto ownerWindow = m_hMainWnd;
+    auto token = m_syncPresentationToken;
+    return m_nativeCredentialPicker->completeOAuth(
+        ownerWindow, callback.view(), [ownerWindow, token](bool success) {
+        postSyncPresentation(ownerWindow, token,
+            success ? XanhFirefoxSyncPresentation::signInCompleted
+                    : XanhFirefoxSyncPresentation::signInFailed);
+    });
+}
+
+bool WebKitBrowserWindow::canHandleFirefoxSyncCallback()
+{
+    return m_nativeCredentialPicker->canHandleOAuthCallback(m_hMainWnd);
+}
+
+void WebKitBrowserWindow::syncFirefoxSync()
+{
+    auto ownerWindow = m_hMainWnd;
+    auto token = m_syncPresentationToken;
+    m_nativeCredentialPicker->syncNow(ownerWindow,
+        [ownerWindow, token](std::optional<XanhNativeCredentialPicker::SyncStatus> status) {
+            postSyncPresentation(ownerWindow, token,
+                status ? syncPresentation(*status)
+                       : XanhFirefoxSyncPresentation::syncFailed);
+        });
+}
+
+void WebKitBrowserWindow::disconnectFirefoxSync(bool deleteLocal)
+{
+    auto picker = m_nativeCredentialPicker;
+    auto ownerWindow = m_hMainWnd;
+    auto token = m_syncPresentationToken;
+    // Thread construction must never unwind through the Win32 window procedure.
+    try {
+        std::thread([picker = std::move(picker), ownerWindow, token, deleteLocal] {
+            bool success = picker->disconnect(deleteLocal);
+            postSyncPresentation(ownerWindow, token,
+                success
+                    ? (deleteLocal
+                        ? XanhFirefoxSyncPresentation::disconnectRemovedLocal
+                        : XanhFirefoxSyncPresentation::disconnectKeptLocal)
+                    : XanhFirefoxSyncPresentation::disconnectFailed);
+        }).detach();
+    } catch (...) {
+        postSyncPresentation(ownerWindow, token,
+            XanhFirefoxSyncPresentation::disconnectFailed);
+    }
+}
+
+bool WebKitBrowserWindow::handleFirefoxSyncPresentation(
+    WPARAM token, LPARAM rawPresentation)
+{
+    if (!m_syncPresentationToken
+        || token != static_cast<WPARAM>(m_syncPresentationToken))
+        return false;
+    auto presentation = static_cast<XanhFirefoxSyncPresentation>(rawPresentation);
+    const wchar_t* message = nullptr;
+    UINT icon = MB_ICONINFORMATION;
+    switch (presentation) {
+    case XanhFirefoxSyncPresentation::signInCompleted:
+        message = L"Firefox Sync sign-in completed. Choose Firefox Sync Now to verify Windows Hello, unlock the local password vault, and sync all four engines.";
+        break;
+    case XanhFirefoxSyncPresentation::signInFailed:
+        message = L"Firefox Sync sign-in could not be completed. The callback was rejected or the account session is no longer valid.";
+        icon = MB_ICONERROR;
+        break;
+    case XanhFirefoxSyncPresentation::syncCompleted:
+        message = L"Firefox Sync completed for bookmarks, history, tabs and passwords.";
+        break;
+    case XanhFirefoxSyncPresentation::syncPartial:
+        message = L"Firefox Sync completed partially. Retry later for the remaining engines.";
+        icon = MB_ICONWARNING;
+        break;
+    case XanhFirefoxSyncPresentation::syncNetworkError:
+        message = L"Firefox Sync could not reach the server. Check the network and retry later.";
+        icon = MB_ICONWARNING;
+        break;
+    case XanhFirefoxSyncPresentation::syncAuthError:
+        message = L"Firefox Sync needs account authentication. Sign in again before retrying.";
+        icon = MB_ICONWARNING;
+        break;
+    case XanhFirefoxSyncPresentation::syncBackedOff:
+        message = L"Firefox Sync is temporarily backed off by the server. Retry later.";
+        icon = MB_ICONWARNING;
+        break;
+    case XanhFirefoxSyncPresentation::syncFailed:
+        message = L"Firefox Sync could not run. Keep Xanh in the foreground, finish any current operation, and try again.";
+        icon = MB_ICONERROR;
+        break;
+    case XanhFirefoxSyncPresentation::disconnectKeptLocal:
+        message = L"Firefox Sync was disconnected; local browser data was kept.";
+        break;
+    case XanhFirefoxSyncPresentation::disconnectRemovedLocal:
+        message = L"Firefox Sync and its local device data were removed.";
+        break;
+    case XanhFirefoxSyncPresentation::disconnectFailed:
+        message = L"Firefox Sync could not finish disconnecting. Retry the same choice so the durable cleanup can resume.";
+        icon = MB_ICONERROR;
+        break;
+    default:
+        return false;
+    }
+    MessageBoxW(m_hMainWnd, message, L"Xanh Browser", MB_OK | icon);
+    return true;
 }
 
 void WebKitBrowserWindow::updateProxySettings()
@@ -298,6 +544,7 @@ HWND WebKitBrowserWindow::hwnd()
 
 HRESULT WebKitBrowserWindow::loadURL(const BSTR& url)
 {
+    m_processRecoveryPolicy.userRequestedNavigation();
     auto page = WKViewGetPage(m_view.get());
     WKPageLoadURL(page, createWKURL(_bstr_t(url)).get());
     return true;
@@ -305,12 +552,14 @@ HRESULT WebKitBrowserWindow::loadURL(const BSTR& url)
 
 void WebKitBrowserWindow::reload()
 {
+    m_processRecoveryPolicy.userRequestedNavigation();
     auto page = WKViewGetPage(m_view.get());
     WKPageReload(page);
 }
 
 void WebKitBrowserWindow::navigateForwardOrBackward(bool forward)
 {
+    m_processRecoveryPolicy.userRequestedNavigation();
     auto page = WKViewGetPage(m_view.get());
     if (forward)
         WKPageGoForward(page);
@@ -486,7 +735,7 @@ void WebKitBrowserWindow::didChangeTitle(const void* clientInfo)
     auto& thisWindow = toWebKitBrowserWindow(clientInfo);
     auto page = WKViewGetPage(thisWindow.m_view.get());
     WKRetainPtr<WKStringRef> title = adoptWK(WKPageCopyTitle(page));
-    std::wstring titleString = createString(title.get()) + L" [WebKit]";
+    std::wstring titleString = createString(title.get()) + L" [Xanh Browser WebKit]";
     SetWindowText(thisWindow.m_hMainWnd, titleString.c_str());
 }
 
@@ -509,6 +758,49 @@ void WebKitBrowserWindow::didChangeActiveURL(const void* clientInfo)
     auto page = WKViewGetPage(thisWindow.m_view.get());
     WKRetainPtr<WKURLRef> url = adoptWK(WKPageCopyActiveURL(page));
     thisWindow.m_client.activeURLChanged(createString(url.get()));
+}
+
+void WebKitBrowserWindow::decidePolicyForNavigationAction(WKPageRef, WKNavigationActionRef navigationAction, WKFramePolicyListenerRef listener, WKTypeRef, const void* clientInfo)
+{
+    auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    WKRetainPtr<WKURLRequestRef> request = adoptWK(WKNavigationActionCopyRequest(navigationAction));
+    WKRetainPtr<WKURLRef> url;
+    if (request)
+        url = adoptWK(WKURLRequestCopyURL(request.get()));
+    WKRetainPtr<WKStringRef> urlString;
+    if (url)
+        urlString = adoptWK(WKURLCopyString(url.get()));
+    if (!urlString || WKStringGetLength(urlString.get()) > XanhNavigationPolicy::maximumURLCharacters) {
+        WKFramePolicyListenerIgnore(listener);
+        return;
+    }
+
+    auto urlValue = createString(urlString.get());
+    bool hasUnconsumedUserGesture = WKNavigationActionHasUnconsumedUserGesture(navigationAction);
+    bool isTrustedLinkClick = WKXanhNavigationActionIsTrustedLinkClick(navigationAction);
+    bool isRedirect = WKXanhNavigationActionIsRedirect(navigationAction);
+    bool isMainFrame = false;
+    auto targetFrame = adoptWK(WKNavigationActionCopyTargetFrameInfo(navigationAction));
+    if (targetFrame)
+        isMainFrame = WKFrameInfoGetIsMainFrame(targetFrame.get());
+    auto decision = XanhNavigationPolicy::decide(urlValue,
+        hasUnconsumedUserGesture,
+        isTrustedLinkClick,
+        isRedirect,
+        WKNavigationActionGetShouldOpenExternalSchemes(navigationAction));
+    if (decision == XanhNavigationPolicy::Decision::allowInWebView) {
+        if (isMainFrame && hasUnconsumedUserGesture && isTrustedLinkClick && !isRedirect)
+            thisWindow.m_processRecoveryPolicy.userRequestedNavigation();
+        WKFramePolicyListenerUse(listener);
+        return;
+    }
+
+    bool shouldOpenExternal = decision == XanhNavigationPolicy::Decision::openExternal && WKXanhNavigationActionTakeUserGesture(navigationAction);
+    WKFramePolicyListenerIgnore(listener);
+    if (!shouldOpenExternal)
+        return;
+
+    ShellExecuteW(thisWindow.m_hMainWnd, L"open", urlValue.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void WebKitBrowserWindow::decidePolicyForNavigationResponse(WKPageRef, WKNavigationResponseRef navigationResponse, WKFramePolicyListenerRef listener, WKTypeRef, const void* clientInfo)
@@ -542,9 +834,74 @@ void WebKitBrowserWindow::decidePolicyForNavigationResponse(WKPageRef, WKNavigat
     }
 }
 
-void WebKitBrowserWindow::didFailProvisionalNavigation(WKPageRef, WKNavigationRef, WKErrorRef error, WKTypeRef, const void* clientInfo)
+void WebKitBrowserWindow::didFinishNavigation(WKPageRef, WKNavigationRef, WKTypeRef, const void* clientInfo)
 {
     auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    thisWindow.m_processRecoveryPolicy.navigationFinished();
+}
+
+void WebKitBrowserWindow::didStartProvisionalNavigation(WKPageRef page, WKNavigationRef, WKTypeRef, const void* clientInfo)
+{
+    auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    thisWindow.m_credentialBridge->navigationStarted(page);
+}
+
+void WebKitBrowserWindow::didCommitNavigation(WKPageRef page, WKNavigationRef, WKTypeRef, const void* clientInfo)
+{
+    auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    thisWindow.m_credentialBridge->navigationFinished(page);
+}
+
+void WebKitBrowserWindow::didSameDocumentNavigation(WKPageRef page, WKNavigationRef, WKSameDocumentNavigationType, WKTypeRef, const void* clientInfo)
+{
+    auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    thisWindow.m_credentialBridge->activeURLChanged(page);
+}
+
+void WebKitBrowserWindow::webProcessDidTerminate(WKPageRef page, WKProcessTerminationReason reason, const void* clientInfo)
+{
+    auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    thisWindow.m_credentialBridge->rendererTerminated(page);
+    auto action = thisWindow.m_processRecoveryPolicy.processTerminated(
+        reason == kWKProcessTerminationReasonRequestedByClient,
+        WKXanhPageCanSafelyRestoreCurrentItem(page));
+    if (action == XanhProcessRecovery::Action::ignoreRequestedTermination)
+        return;
+    if (action == XanhProcessRecovery::Action::restorePage) {
+        WKPageReload(page);
+        return;
+    }
+
+    if (WKPageGetIsControlledByAutomation(page))
+        return;
+
+    const wchar_t* detail = action == XanhProcessRecovery::Action::refuseUnsafeRestore
+        ? L"The web process stopped during a navigation that cannot be replayed safely. Automatic reload was blocked to avoid resubmitting data. Use the address bar to continue."
+        : L"The web process stopped repeatedly. Automatic recovery was paused to avoid a crash loop. Use Reload to try again.";
+    if (action == XanhProcessRecovery::Action::refuseUnsafeRestore) {
+        MessageBox(thisWindow.m_hMainWnd, detail, L"Web Process Stopped", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    switch (reason) {
+    case kWKProcessTerminationReasonExceededMemoryLimit:
+        detail = L"The web process repeatedly exceeded its memory limit. Automatic recovery was paused. Use Reload to try again.";
+        break;
+    case kWKProcessTerminationReasonExceededCPULimit:
+        detail = L"The web process repeatedly exceeded its CPU limit. Automatic recovery was paused. Use Reload to try again.";
+        break;
+    case kWKProcessTerminationReasonCrash:
+        detail = L"The web process crashed repeatedly. Automatic recovery was paused. Use Reload to try again.";
+        break;
+    default:
+        break;
+    }
+    MessageBox(thisWindow.m_hMainWnd, detail, L"Web Process Stopped", MB_OK | MB_ICONWARNING);
+}
+
+void WebKitBrowserWindow::didFailProvisionalNavigation(WKPageRef page, WKNavigationRef, WKErrorRef error, WKTypeRef, const void* clientInfo)
+{
+    auto& thisWindow = toWebKitBrowserWindow(clientInfo);
+    thisWindow.m_credentialBridge->activeURLChanged(page);
     std::wstringstream text;
     text << createString(adoptWK(WKErrorCopyLocalizedDescription(error)).get()) << std::endl;
     text << L"Error Code: " << WKErrorGetErrorCode(error) << std::endl;
@@ -617,14 +974,14 @@ std::wstring toAuthText(WKProtectionSpaceRef protectionSpace)
     return text.str();
 }
 
-void WebKitBrowserWindow::didReceiveAuthenticationChallenge(WKPageRef, WKAuthenticationChallengeRef challenge, const void* clientInfo)
+void WebKitBrowserWindow::didReceiveAuthenticationChallenge(WKPageRef page, WKAuthenticationChallengeRef challenge, const void* clientInfo)
 {
     auto& thisWindow = toWebKitBrowserWindow(clientInfo);
     auto protectionSpace = WKAuthenticationChallengeGetProtectionSpace(challenge);
     auto decisionListener = WKAuthenticationChallengeGetDecisionListener(challenge);
     auto authenticationScheme = WKProtectionSpaceGetAuthenticationScheme(protectionSpace);
 
-    if (thisWindow.m_isControlledByAutomation) {
+    if (WKPageGetIsControlledByAutomation(page)) {
         WKRetainPtr<WKStringRef> username = createWKString("accept server trust");
         WKRetainPtr<WKStringRef> password = createWKString("");
         WKRetainPtr<WKCredentialRef> wkCredential = adoptWK(WKCredentialCreate(username.get(), password.get(), kWKCredentialPersistenceForSession));
@@ -805,4 +1162,3 @@ void WebKitBrowserWindow::runJavaScriptPrompt(WKPageRef, WKStringRef message, WK
     MessageBox(thisWindow.m_hMainWnd, text.c_str(), title.c_str(), MB_OK);
     WKPageRunJavaScriptPromptResultListenerCall(listener, defaultValue);
 }
-

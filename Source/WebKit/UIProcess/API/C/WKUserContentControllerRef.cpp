@@ -28,6 +28,7 @@
 
 #include "APIArray.h"
 #include "APICompletionListener.h"
+#include "APIContentWorld.h"
 #include "APIContentRuleList.h"
 #include "APIFrameInfo.h"
 #include "APIScriptMessage.h"
@@ -66,6 +67,19 @@ void WKUserContentControllerRemoveAllUserScripts(WKUserContentControllerRef user
     toProtectedImpl(userContentControllerRef)->removeAllUserScripts();
 }
 
+void WKXanhUserContentControllerRemoveAllUserScriptsInWorld(WKUserContentControllerRef userContentControllerRef, WKStringRef worldNameRef)
+{
+    if (!worldNameRef)
+        return;
+
+    String worldName = toWTFString(worldNameRef);
+    if (worldName.isEmpty() || worldName.length() > 128)
+        return;
+
+    auto world = API::ContentWorld::sharedWorldWithName(worldName);
+    toProtectedImpl(userContentControllerRef)->removeAllUserScripts(world.get());
+}
+
 void WKUserContentControllerAddUserContentFilter(WKUserContentControllerRef userContentControllerRef, WKUserContentFilterRef userContentFilterRef)
 {
 #if ENABLE(CONTENT_EXTENSIONS)
@@ -88,9 +102,9 @@ public:
         , m_callback(callback)
         , m_context(context) { }
 private:
-    void didPostMessage(WebPageProxy& page, FrameInfoData&& frameInfo, API::ContentWorld&, JavaScriptEvaluationResult&& result, CompletionHandler<void(Expected<JavaScriptEvaluationResult, String>&&)>&& completionHandler) override
+    void didPostMessage(WebPageProxy& page, FrameInfoData&& frameInfo, API::ContentWorld& contentWorld, JavaScriptEvaluationResult&& result, CompletionHandler<void(Expected<JavaScriptEvaluationResult, String>&&)>&& completionHandler) override
     {
-        Ref message = API::ScriptMessage::create(result.toAPI(), page, API::FrameInfo::create(WTF::move(frameInfo)), m_name, API::ContentWorld::pageContentWorldSingleton());
+        Ref message = API::ScriptMessage::create(result.toAPI(), page, API::FrameInfo::create(WTF::move(frameInfo)), m_name, contentWorld);
         Ref listener = API::CompletionListener::create([completionHandler = WTF::move(completionHandler)] (WKTypeRef reply) mutable {
             if (auto result = JavaScriptEvaluationResult::extract(toProtectedImpl(reply).get()))
                 return completionHandler(WTF::move(*result));
@@ -117,4 +131,33 @@ void WKUserContentControllerAddScriptMessageHandler(WKUserContentControllerRef u
 void WKUserContentControllerRemoveAllUserMessageHandlers(WKUserContentControllerRef userContentController)
 {
     toProtectedImpl(userContentController)->removeAllUserMessageHandlers();
+}
+
+bool WKXanhUserContentControllerAddScriptMessageHandlerInWorld(WKUserContentControllerRef userContentController, WKStringRef wkName, WKStringRef worldNameRef, WKScriptMessageHandlerCallback callback, const void* context)
+{
+    if (!wkName || !worldNameRef || !callback)
+        return false;
+
+    String name = toWTFString(wkName);
+    String worldName = toWTFString(worldNameRef);
+    if (name.isEmpty() || name.length() > 128 || worldName.isEmpty() || worldName.length() > 128)
+        return false;
+
+    auto world = API::ContentWorld::sharedWorldWithName(worldName);
+    auto handler = WebKit::WebScriptMessageHandler::create(makeUnique<WebScriptMessageClient>(name, callback, context), name, world.get());
+    return toProtectedImpl(userContentController)->addUserScriptMessageHandler(handler);
+}
+
+void WKXanhUserContentControllerRemoveScriptMessageHandlerInWorld(WKUserContentControllerRef userContentController, WKStringRef wkName, WKStringRef worldNameRef)
+{
+    if (!wkName || !worldNameRef)
+        return;
+
+    String name = toWTFString(wkName);
+    String worldName = toWTFString(worldNameRef);
+    if (name.isEmpty() || name.length() > 128 || worldName.isEmpty() || worldName.length() > 128)
+        return;
+
+    auto world = API::ContentWorld::sharedWorldWithName(worldName);
+    toProtectedImpl(userContentController)->removeUserMessageHandlerForName(name, world.get());
 }

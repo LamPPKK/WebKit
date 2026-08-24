@@ -11,14 +11,32 @@ set(MiniBrowser_SOURCES
     MiniBrowserLib.rc
     WebKitBrowserWindow.cpp
     WinMain.cpp
+    XanhCredentialBridge.cpp
+    XanhCredentialRecords.cpp
+    XanhDpapiSecretStore.cpp
+    XanhNativeCredentialPicker.cpp
+    XanhNativeSyncLibrary.cpp
+    XanhNativeSyncRuntime.cpp
+    XanhOAuthCallback.cpp
+    XanhWindowsHello.cpp
+    XanhPortableBackup.cpp
     stdafx.cpp
 )
 
 set(MiniBrowser_PRIVATE_DEFINITIONS _UNICODE)
 set(MiniBrowser_PRIVATE_LIBRARIES
+    advapi32
     comctl32
+    bcrypt
+    crypt32
+    normaliz
+    ole32
+    shell32
     shlwapi
     user32
+    uuid
+    wintrust
+    windowsapp
 )
 set(MiniBrowser_FRAMEWORKS
     JavaScriptCore
@@ -38,4 +56,4 @@ target_include_directories(MiniBrowserInjectedBundle PRIVATE ${CMAKE_BINARY_DIR}
 WEBKIT_EXECUTABLE_DECLARE(MiniBrowser)
 WEBKIT_EXECUTABLE(MiniBrowser)
 
-set_target_properties(MiniBrowser PROPERTIES WIN32_EXECUTABLE ON)
+set_target_properties(MiniBrowser PROPERTIES WIN32_EXECUTABLE ON OUTPUT_NAME "XanhBrowser.WebKit")

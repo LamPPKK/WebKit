@@ -28,6 +28,26 @@
 #include <windows.h>
 #include <wtf/RefCounted.h>
 
+inline constexpr UINT XanhActivateExistingWindowMessage = WM_APP + 0x510;
+inline constexpr UINT XanhFirefoxSyncResultMessage = WM_APP + 0x511;
+inline constexpr ULONG_PTR XanhOAuthCallbackCopyData = 0x58414E480001;
+inline constexpr ULONG_PTR XanhNavigationCopyData = 0x58414E480002;
+inline constexpr size_t XanhMaximumInterprocessURLCharacters = 32 * 1024;
+
+enum class XanhFirefoxSyncPresentation : LPARAM {
+    signInCompleted = 1,
+    signInFailed,
+    syncCompleted,
+    syncPartial,
+    syncNetworkError,
+    syncAuthError,
+    syncBackedOff,
+    syncFailed,
+    disconnectKeptLocal,
+    disconnectRemovedLocal,
+    disconnectFailed,
+};
+
 class BrowserWindowClient {
 public:
     virtual void progressChanged(double) = 0;
@@ -70,6 +90,13 @@ public:
 
     virtual void clearCookies() = 0;
     virtual void clearWebsiteData() = 0;
+    virtual void applicationActivationChanged(bool, HWND) { }
+    virtual void beginFirefoxSync() { }
+    virtual void syncFirefoxSync() { }
+    virtual void disconnectFirefoxSync(bool) { }
+    virtual bool canHandleFirefoxSyncCallback() { return false; }
+    virtual bool handleFirefoxSyncCallback(std::wstring&&) { return false; }
+    virtual bool handleFirefoxSyncPresentation(WPARAM, LPARAM) { return false; }
 
     virtual void adjustScaleFactors() = 0;
 };

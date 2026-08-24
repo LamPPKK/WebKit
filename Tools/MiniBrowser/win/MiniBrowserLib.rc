@@ -43,6 +43,15 @@ BEGIN
     POPUP "&File"
     BEGIN
         MENUITEM "&Print\tCtrl-P",              IDM_PRINT
+        MENUITEM SEPARATOR
+        MENUITEM "Export encrypted backup...", IDM_EXPORT_PORTABLE_BACKUP
+        MENUITEM "Import encrypted backup...", IDM_IMPORT_PORTABLE_BACKUP
+        MENUITEM SEPARATOR
+        MENUITEM "Sign in to Firefox Sync...", IDM_FIREFOX_SYNC_SIGN_IN
+        MENUITEM "Sync now",                   IDM_FIREFOX_SYNC_NOW
+        MENUITEM "Disconnect Firefox Sync",    IDM_FIREFOX_SYNC_DISCONNECT
+        MENUITEM "Remove Sync data from this device", IDM_FIREFOX_SYNC_REMOVE_DEVICE
+        MENUITEM SEPARATOR
         MENUITEM "E&xit",                       IDM_EXIT
         MENUITEM "New Window",                  IDM_NEW_WEBKIT_WINDOW
         MENUITEM "Close\tCtrl-W",               IDM_CLOSE_WINDOW
@@ -169,8 +178,8 @@ CAPTION "About"
 FONT 8, "MS Shell Dlg", 0, 0, 0x0
 BEGIN
     ICON            IDI_MINIBROWSER,IDC_MYICON,14,9,20,20
-    LTEXT           "MiniBrowser Version 1.1",IDC_STATIC,49,10,119,8
-    LTEXT           "Copyright (C) 2015-2019",IDC_STATIC,49,20,119,8
+    LTEXT           "Xanh Browser WebKit 1.0",IDC_STATIC,49,10,119,8
+    LTEXT           "Powered by WebKit",IDC_STATIC,49,20,119,8
     DEFPUSHBUTTON   "OK",IDOK,186,10,30,11,WS_GROUP
 END
 
@@ -316,6 +325,20 @@ BEGIN
     EDITTEXT        IDC_SERVER_TRUST_TEXT,7,24,305,130,ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_HSCROLL | NOT WS_TABSTOP
 END
 
+IDD_PORTABLE_BACKUP_PASSWORD DIALOGEX 0, 0, 260, 92
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Encrypted Xanh Browser backup"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Enter the backup password.",IDC_BACKUP_PROMPT,7,7,246,10
+    LTEXT           "Password:",IDC_STATIC,7,26,58,8
+    EDITTEXT        IDC_BACKUP_PASSWORD,68,23,185,14,ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Confirm password:",IDC_BACKUP_CONFIRMATION_LABEL,7,45,58,8
+    EDITTEXT        IDC_BACKUP_CONFIRMATION,68,42,185,14,ES_PASSWORD | ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK",IDOK,147,70,50,14
+    PUSHBUTTON      "Cancel",IDCANCEL,203,70,50,14
+END
+
 
 #ifdef APSTUDIO_INVOKED
 /////////////////////////////////////////////////////////////////////////////
@@ -420,8 +443,8 @@ IDB_TOOLBAR             BITMAP                  "toolbar.bmp"
 
 STRINGTABLE
 BEGIN
-    IDS_APP_TITLE           "MiniBrowser"
-    IDC_MINIBROWSER         "MINIBROWSER"
+    IDS_APP_TITLE           "Xanh Browser WebKit"
+    IDC_MINIBROWSER         "XANHBROWSERWEBKIT"
 END
 
 #endif    // English (United States) resources

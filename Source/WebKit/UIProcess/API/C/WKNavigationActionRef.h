@@ -41,6 +41,9 @@ WK_EXPORT bool WKNavigationActionGetShouldOpenExternalSchemes(WKNavigationAction
 WK_EXPORT WKFrameInfoRef WKNavigationActionCopyTargetFrameInfo(WKNavigationActionRef action);
 WK_EXPORT WKFrameNavigationType WKNavigationActionGetNavigationType(WKNavigationActionRef action);
 WK_EXPORT bool WKNavigationActionHasUnconsumedUserGesture(WKNavigationActionRef action);
+WK_EXPORT bool WKXanhNavigationActionIsTrustedLinkClick(WKNavigationActionRef action);
+WK_EXPORT bool WKXanhNavigationActionIsRedirect(WKNavigationActionRef action);
+WK_EXPORT bool WKXanhNavigationActionTakeUserGesture(WKNavigationActionRef action);
 
 #ifdef __cplusplus
 }

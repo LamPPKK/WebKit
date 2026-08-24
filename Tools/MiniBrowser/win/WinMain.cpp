@@ -33,6 +33,107 @@
 #include "MiniBrowserLibResource.h"
 #include "WebKitBrowserWindow.h"
 
+#include <sddl.h>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+std::wstring processMutexName()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return { };
+    DWORD required = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+    std::vector<unsigned char> storage(required);
+    bool read = required && GetTokenInformation(
+        token, TokenUser, storage.data(), required, &required);
+    CloseHandle(token);
+    if (!read)
+        return { };
+    auto* user = reinterpret_cast<TOKEN_USER*>(storage.data());
+    LPWSTR sid = nullptr;
+    if (!ConvertSidToStringSidW(user->User.Sid, &sid) || !sid)
+        return { };
+    std::wstring result = L"Global\\XanhBrowser.WinCairo.Process.v1.";
+    result += sid;
+    LocalFree(sid);
+    return result;
+}
+
+bool isSameExecutable(HWND window)
+{
+    DWORD processID = 0;
+    if (!window || !GetWindowThreadProcessId(window, &processID)
+        || !processID || processID == GetCurrentProcessId())
+        return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+        FALSE, processID);
+    if (!process)
+        return false;
+    std::vector<wchar_t> other(32768);
+    DWORD otherLength = static_cast<DWORD>(other.size());
+    bool queried = QueryFullProcessImageNameW(
+        process, 0, other.data(), &otherLength);
+    CloseHandle(process);
+    if (!queried || !otherLength || otherLength >= other.size())
+        return false;
+    std::vector<wchar_t> current(32768);
+    auto currentLength = GetModuleFileNameW(
+        nullptr, current.data(), static_cast<DWORD>(current.size()));
+    return currentLength && currentLength < current.size()
+        && currentLength == otherLength
+        && !_wcsnicmp(current.data(), other.data(), currentLength);
+}
+
+HWND waitForPrimaryWindow(HINSTANCE instance)
+{
+    for (unsigned attempt = 0; attempt < 200; ++attempt) {
+        auto window = MainWindow::findExistingInstance(instance);
+        if (isSameExecutable(window))
+            return window;
+        Sleep(10);
+    }
+    return nullptr;
+}
+
+bool isFirefoxSyncCallback(std::wstring_view value)
+{
+    constexpr std::wstring_view callbackScheme = L"xanh-browser-wincairo:";
+    return value.size() >= callbackScheme.size()
+        && !_wcsnicmp(value.data(), callbackScheme.data(), callbackScheme.size());
+}
+
+bool forwardToPrimary(HWND primary, const std::wstring& value)
+{
+    if (!primary || value.size() > XanhMaximumInterprocessURLCharacters
+        || value.find(L'\0') != std::wstring_view::npos)
+        return false;
+    if (value.empty())
+        return PostMessageW(primary, XanhActivateExistingWindowMessage, 0, 0);
+    COPYDATASTRUCT data { };
+    data.dwData = isFirefoxSyncCallback(value)
+        ? XanhOAuthCallbackCopyData : XanhNavigationCopyData;
+    data.cbData = static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t));
+    data.lpData = const_cast<wchar_t*>(value.data());
+    DWORD_PTR response = 0;
+    return SendMessageTimeoutW(primary, WM_COPYDATA, 0,
+        reinterpret_cast<LPARAM>(&data),
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, &response)
+        && response == TRUE;
+}
+
+void wipe(std::wstring& value)
+{
+    if (!value.empty())
+        SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t));
+    value.clear();
+}
+
+} // namespace
+
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int nCmdShow)
 {
     hInst = hInstance;
@@ -51,6 +152,39 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
     InitCommonControlsEx(&InitCtrlEx);
 
     auto options = parseCommandLine();
+    std::wstring requestedURL;
+    if (options.requestedURL.length()) {
+        requestedURL.assign(
+            options.requestedURL.GetBSTR(), options.requestedURL.length());
+        SecureZeroMemory(options.requestedURL.GetBSTR(),
+            SysStringByteLen(options.requestedURL.GetBSTR()));
+        options.requestedURL = L"";
+    }
+
+    auto mutexName = processMutexName();
+    HANDLE processMutex = mutexName.empty()
+        ? nullptr : CreateMutexW(nullptr, FALSE, mutexName.c_str());
+    auto mutexError = GetLastError();
+    if (!processMutex) {
+        wipe(requestedURL);
+        MessageBoxW(nullptr,
+            L"Xanh Browser could not establish its per-user process lock.",
+            L"Xanh Browser", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (mutexError == ERROR_ALREADY_EXISTS) {
+        auto primary = waitForPrimaryWindow(hInstance);
+        bool forwarded = forwardToPrimary(primary, requestedURL);
+        wipe(requestedURL);
+        CloseHandle(processMutex);
+        if (!forwarded) {
+            MessageBoxW(nullptr,
+                L"Xanh Browser could not securely deliver this request to the running browser process.",
+                L"Xanh Browser", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+        return 0;
+    }
 
     if (options.useFullDesktop)
         computeFullDesktopFrame();
@@ -69,9 +203,20 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
     hAccelTable = LoadAccelerators(hInst, MAKEINTRESOURCE(IDC_MINIBROWSER));
     hPreAccelTable = LoadAccelerators(hInst, MAKEINTRESOURCE(IDR_ACCELERATORS_PRE));
 
-    if (options.requestedURL.length())
-        mainWindow.loadURL(options.requestedURL.GetBSTR());
-    else
+    if (!requestedURL.empty()) {
+        if (isFirefoxSyncCallback(requestedURL)) {
+            if (!mainWindow.browserWindow()->canHandleFirefoxSyncCallback()
+                || !mainWindow.browserWindow()->handleFirefoxSyncCallback(
+                    std::move(requestedURL))) {
+                wipe(requestedURL);
+                MessageBoxW(mainWindow.hwnd(),
+                    L"This Firefox Sync callback does not match an active sign-in.",
+                    L"Xanh Browser", MB_OK | MB_ICONERROR);
+            }
+            mainWindow.goHome();
+        } else
+            mainWindow.loadURL(std::move(requestedURL));
+    } else
         mainWindow.goHome();
 
 #pragma warning(disable:4509)
@@ -98,6 +243,8 @@ exit:
 
     // Shut down COM.
     OleUninitialize();
+    wipe(requestedURL);
+    CloseHandle(processMutex);
 
     return static_cast<int>(msg.wParam);
 }

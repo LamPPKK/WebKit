@@ -39,6 +39,7 @@ WK_EXPORT WKUserContentControllerRef WKUserContentControllerCreate(void);
 WK_EXPORT WKArrayRef WKUserContentControllerCopyUserScripts(WKUserContentControllerRef userContentController);
 WK_EXPORT void WKUserContentControllerAddUserScript(WKUserContentControllerRef userContentController, WKUserScriptRef userScript);
 WK_EXPORT void WKUserContentControllerRemoveAllUserScripts(WKUserContentControllerRef userContentController);
+WK_EXPORT void WKXanhUserContentControllerRemoveAllUserScriptsInWorld(WKUserContentControllerRef userContentController, WKStringRef worldName);
 
 WK_EXPORT void WKUserContentControllerAddUserContentFilter(WKUserContentControllerRef userContentController, WKUserContentFilterRef userContentFilter);
 WK_EXPORT void WKUserContentControllerRemoveAllUserContentFilters(WKUserContentControllerRef userContentController);
@@ -46,6 +47,8 @@ WK_EXPORT void WKUserContentControllerRemoveAllUserContentFilters(WKUserContentC
 typedef void (*WKScriptMessageHandlerCallback)(WKScriptMessageRef message, WKCompletionListenerRef reply, const void *context);
 WK_EXPORT void WKUserContentControllerAddScriptMessageHandler(WKUserContentControllerRef userContentController, WKStringRef name, WKScriptMessageHandlerCallback callback, const void* context);
 WK_EXPORT void WKUserContentControllerRemoveAllUserMessageHandlers(WKUserContentControllerRef userContentController);
+WK_EXPORT bool WKXanhUserContentControllerAddScriptMessageHandlerInWorld(WKUserContentControllerRef userContentController, WKStringRef name, WKStringRef worldName, WKScriptMessageHandlerCallback callback, const void* context);
+WK_EXPORT void WKXanhUserContentControllerRemoveScriptMessageHandlerInWorld(WKUserContentControllerRef userContentController, WKStringRef name, WKStringRef worldName);
 
 #ifdef __cplusplus
 }

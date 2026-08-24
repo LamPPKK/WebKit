@@ -60,6 +60,7 @@
 #define IDD_SERVER_TRUST                179
 #define IDR_ACCELERATORS_PRE            180
 #define IDB_TOOLBAR                     181
+#define IDD_PORTABLE_BACKUP_PASSWORD    182
 #define IDC_EMPTY_URL_CACHE             1000
 #define IDC_RETURN_FREE_MEMORY          1001
 #define IDC_EMPTY_WEBCORE_CACHE         1002
@@ -122,6 +123,10 @@
 #define IDC_PROXY_EXCLUDE               1060
 #define IDC_PROXY_DISABLE               1061
 #define IDC_SERVER_TRUST_TEXT           1062
+#define IDC_BACKUP_PASSWORD             1063
+#define IDC_BACKUP_CONFIRMATION         1064
+#define IDC_BACKUP_PROMPT               1065
+#define IDC_BACKUP_CONFIRMATION_LABEL   1066
 #define IDM_EXPERIMENTAL_FEATURES_BEGIN 30000
 #define IDM_EXPERIMENTAL_FEATURES_END   30999
 #define IDM_INTERNAL_DEBUG_FEATURES_BEGIN 31000
@@ -136,6 +141,12 @@
 #define IDM_INTERNAL_DEBUG_FEATURES_RESET_ALL_TO_DEFAULTS 32784
 #define IDM_CLEAR_COOKIES               32785
 #define IDM_CLEAR_WEBSITE_DATA          32786
+#define IDM_EXPORT_PORTABLE_BACKUP      32787
+#define IDM_IMPORT_PORTABLE_BACKUP      32788
+#define IDM_FIREFOX_SYNC_SIGN_IN        32789
+#define IDM_FIREFOX_SYNC_NOW            32790
+#define IDM_FIREFOX_SYNC_DISCONNECT     32791
+#define IDM_FIREFOX_SYNC_REMOVE_DEVICE  32792
 #define IDC_STATIC                      -1
 
 // Next default values for new objects
@@ -143,9 +154,9 @@
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NO_MFC                     1
-#define _APS_NEXT_RESOURCE_VALUE        182
-#define _APS_NEXT_COMMAND_VALUE         32787
-#define _APS_NEXT_CONTROL_VALUE         1063
+#define _APS_NEXT_RESOURCE_VALUE        183
+#define _APS_NEXT_COMMAND_VALUE         32793
+#define _APS_NEXT_CONTROL_VALUE         1067
 #define _APS_NEXT_SYMED_VALUE           110
 #endif
 #endif

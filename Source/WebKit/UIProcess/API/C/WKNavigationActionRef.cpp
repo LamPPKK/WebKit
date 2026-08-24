@@ -65,3 +65,23 @@ WK_EXPORT bool WKNavigationActionHasUnconsumedUserGesture(WKNavigationActionRef 
 {
     return WebKit::toImpl(action)->isProcessingUnconsumedUserGesture();
 }
+
+WK_EXPORT bool WKXanhNavigationActionIsTrustedLinkClick(WKNavigationActionRef action)
+{
+    auto* navigationAction = WebKit::toImpl(action);
+    return navigationAction->navigationType() == WebCore::NavigationType::LinkClicked && navigationAction->mouseButton() != WebKit::WebMouseEventButton::None;
+}
+
+WK_EXPORT bool WKXanhNavigationActionIsRedirect(WKNavigationActionRef action)
+{
+    return WebKit::toImpl(action)->isRedirect();
+}
+
+WK_EXPORT bool WKXanhNavigationActionTakeUserGesture(WKNavigationActionRef action)
+{
+    auto* userInitiatedAction = WebKit::toImpl(action)->userInitiatedAction();
+    if (!userInitiatedAction || userInitiatedAction->consumed())
+        return false;
+    userInitiatedAction->setConsumed();
+    return true;
+}

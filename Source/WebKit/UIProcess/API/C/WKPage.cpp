@@ -26,6 +26,7 @@
 #include "config.h"
 #include "WKPage.h"
 #include "WKPagePrivate.h"
+#include "XanhFrameStateRestorePolicy.h"
 
 #include "APIArray.h"
 #include "APICompletionListener.h"
@@ -83,6 +84,7 @@
 #include "WKPluginInformation.h"
 #include "WebBackForwardCache.h"
 #include "WebBackForwardList.h"
+#include "WebBackForwardListItem.h"
 #include "WebFormClient.h"
 #include "WebFrameProxy.h"
 #include "WebFullScreenManagerProxy.h"
@@ -363,6 +365,12 @@ void WKPageReloadExpiredOnly(WKPageRef pageRef)
 {
     CRASH_IF_SUSPENDED;
     toProtectedImpl(pageRef)->reload(WebCore::ReloadOption::ExpiredOnly);
+}
+
+bool WKXanhPageCanSafelyRestoreCurrentItem(WKPageRef pageRef)
+{
+    RefPtr item = toProtectedImpl(pageRef)->backForwardList().currentItem();
+    return item && XanhProcessRecovery::canSafelyRestoreFrameTree(item->mainFrameState().get());
 }
 
 bool WKPageTryClose(WKPageRef pageRef)
